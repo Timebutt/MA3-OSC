@@ -1,0 +1,23 @@
+[package]
+name = "ma3-osc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+midir = "0.10"
+rosc = "0.10"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tao = "0.37.2"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.26.1"
+wry = "0.57.2"
+
+[dev-dependencies]
+mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

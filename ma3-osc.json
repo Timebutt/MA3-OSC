@@ -1,0 +1,24 @@
+{
+    "ma": {
+        "host": "127.0.0.1",
+        "port": 9003,
+        "listenPort": 9004,
+        "prefix": "",
+        "faderRange": 127
+    },
+    "devices": [
+        {
+            "name": "xtouch",
+            "match": "X-Touch",
+            "mapping": "mappings/xTouch1.json"
+        },
+        {
+            "name": "compact",
+            "match": "X-Touch Compact",
+            "mapping": "mappings/xTouchCompact1.json"
+        }
+    ],
+    "surfaceRefreshSecs": 2,
+    "faderEchoGuardMs": 300,
+    "heartbeatTimeoutMs": 3000
+}

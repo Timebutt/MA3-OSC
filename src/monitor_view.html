@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MA3-OSC message monitor</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1d2127; --muted: #6b7380; --line: #e3e6ea; --bar: #f5f6f8;
+  --midi-in: #1f6fd1; --midi-out: #7a54c7; --osc-in: #b86e00; --osc-out: #1d8a4a; --warn: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17191c; --fg: #e4e6ea; --muted: #8b929c; --line: #2a2e33; --bar: #1f2226;
+    --midi-in: #6aa8ff; --midi-out: #b596ff; --osc-in: #f0a840; --osc-out: #4fcf83; --warn: #ff6b5b;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 13px -apple-system, "Segoe UI", system-ui, sans-serif; }
+body { display: flex; flex-direction: column; }
+.bar { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; padding: 8px 12px;
+  background: var(--bar); border-bottom: 1px solid var(--line); }
+.bar label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; user-select: none; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+input[type=search] { flex: 1 1 160px; min-width: 120px; padding: 4px 8px; border: 1px solid var(--line);
+  border-radius: 5px; background: var(--bg); color: var(--fg); font: inherit; }
+button { padding: 4px 10px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg);
+  color: var(--fg); font: inherit; cursor: pointer; }
+button.on { background: var(--warn); color: #fff; border-color: var(--warn); }
+.spacer { flex: 1; }
+#status { color: var(--muted); font-size: 12px; }
+#log { flex: 1; overflow-y: auto; font: 12px ui-monospace, Menlo, Consolas, monospace; }
+.row { display: grid; grid-template-columns: 92px 74px 90px minmax(0, 1fr) minmax(0, 0.7fr);
+  gap: 10px; padding: 2px 12px; border-bottom: 1px solid var(--line); white-space: pre; }
+.row > span { overflow: hidden; text-overflow: ellipsis; }
+.t, .hex { color: var(--muted); }
+.d { font-weight: 600; }
+.midi-in .d { color: var(--midi-in); } .midi-out .d { color: var(--midi-out); }
+.osc-in .d { color: var(--osc-in); } .osc-out .d { color: var(--osc-out); }
+.note { padding: 3px 12px; color: var(--warn); border-bottom: 1px solid var(--line); }
+body.hide-midi-in .midi-in, body.hide-midi-out .midi-out,
+body.hide-osc-in .osc-in, body.hide-osc-out .osc-out, .row.nomatch { display: none; }
+@media (max-width: 640px) { .row { grid-template-columns: 80px 64px minmax(0, 1fr); } .row .dev, .row .hex { display: none; } }
+</style>
+</head>
+<body class="hide-midi-out hide-osc-in">
+<div class="bar">
+  <label><input type="checkbox" data-dir="midi-in" checked><span class="dot" style="background:var(--midi-in)"></span>MIDI in</label>
+  <label><input type="checkbox" data-dir="osc-out" checked><span class="dot" style="background:var(--osc-out)"></span>OSC out</label>
+  <label><input type="checkbox" data-dir="osc-in"><span class="dot" style="background:var(--osc-in)"></span>OSC in</label>
+  <label><input type="checkbox" data-dir="midi-out"><span class="dot" style="background:var(--midi-out)"></span>MIDI out</label>
+  <input type="search" id="filter" placeholder="Filter, e.g. Fader201 or xtouch">
+  <button id="pause">Pause</button>
+  <button id="clear">Clear</button>
+  <button id="save">Save…</button>
+  <label><input type="checkbox" id="follow" checked>Follow</label>
+  <span class="spacer"></span>
+  <span id="status">waiting for messages…</span>
+</div>
+<div id="log"></div>
+<script>
+const MAX_ROWS = 5000;
+const DIRS = { "midi-in": "MIDI in", "midi-out": "MIDI out", "osc-in": "OSC in", "osc-out": "OSC out" };
+const log = document.getElementById("log");
+const filter = document.getElementById("filter");
+const follow = document.getElementById("follow");
+const status = document.getElementById("status");
+let paused = false, queued = [], total = 0, needle = "";
+
+function pad(n, w) { return String(n).padStart(w, "0"); }
+function time(ms) {
+  const d = new Date(ms);
+  return pad(d.getHours(), 2) + ":" + pad(d.getMinutes(), 2) + ":" + pad(d.getSeconds(), 2) + "." + pad(d.getMilliseconds(), 3);
+}
+function cell(cls, text) { const s = document.createElement("span"); s.className = cls; s.textContent = text; return s; }
+function matches(row) { return !needle || row.dataset.search.includes(needle); }
+
+function render(entries) {
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
+  const frag = document.createDocumentFragment();
+  for (const e of entries) {
+    const row = document.createElement("div");
+    row.className = "row " + e.dir;
+    row.append(cell("t", time(e.ms)), cell("d", DIRS[e.dir]), cell("dev", e.dev), cell("txt", e.text), cell("hex", e.hex));
+    row.dataset.search = (e.dev + " " + e.text + " " + e.hex).toLowerCase();
+    row.dataset.line = time(e.ms) + "  " + DIRS[e.dir].padEnd(8) + "  " + e.dev.padEnd(10) + "  " + e.text + (e.hex ? "  [" + e.hex + "]" : "");
+    if (!matches(row)) row.classList.add("nomatch");
+    frag.append(row);
+  }
+  log.append(frag);
+  while (log.childElementCount > MAX_ROWS) log.firstElementChild.remove();
+  if (follow.checked && (atBottom || entries.length)) log.scrollTop = log.scrollHeight;
+}
+
+function showStatus() {
+  status.textContent = paused ? "paused, " + queued.length + " new" : total + " messages";
+}
+
+// called by MA3-OSC
+window.pb = {
+  add(entries, dropped) {
+    if (dropped > 0) {
+      const n = document.createElement("div");
+      n.className = "note";
+      n.textContent = dropped + " messages not shown (too many at once)";
+      log.append(n);
+    }
+    total += entries.length;
+    if (paused) { queued.push(...entries); if (queued.length > MAX_ROWS) queued.splice(0, queued.length - MAX_ROWS); }
+    else render(entries);
+    showStatus();
+  },
+  saved(msg) { status.textContent = msg; },
+};
+
+document.querySelectorAll("[data-dir]").forEach(cb => cb.addEventListener("change", () => {
+  document.body.classList.toggle("hide-" + cb.dataset.dir, !cb.checked);
+}));
+filter.addEventListener("input", () => {
+  needle = filter.value.trim().toLowerCase();
+  for (const row of log.querySelectorAll(".row")) row.classList.toggle("nomatch", !matches(row));
+});
+document.getElementById("pause").addEventListener("click", ev => {
+  paused = !paused;
+  ev.target.textContent = paused ? "Resume" : "Pause";
+  ev.target.classList.toggle("on", paused);
+  if (!paused) { render(queued); queued = []; }
+  showStatus();
+});
+document.getElementById("clear").addEventListener("click", () => { log.replaceChildren(); queued = []; total = 0; showStatus(); });
+document.getElementById("save").addEventListener("click", () => {
+  const hidden = d => document.body.classList.contains("hide-" + d);
+  const lines = [...log.querySelectorAll(".row")]
+    .filter(r => !r.classList.contains("nomatch") && !Object.keys(DIRS).some(d => r.classList.contains(d) && hidden(d)))
+    .map(r => r.dataset.line);
+  const d = new Date();
+  const name = "monitor-" + d.getFullYear() + pad(d.getMonth() + 1, 2) + pad(d.getDate(), 2) + "-" +
+    pad(d.getHours(), 2) + pad(d.getMinutes(), 2) + pad(d.getSeconds(), 2);
+  window.ipc.postMessage(JSON.stringify({ save: name, text: lines.join("\n") + "\n" }));
+});
+</script>
+</body>
+</html>
