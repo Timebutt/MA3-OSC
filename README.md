@@ -50,7 +50,7 @@ In MA, set up OSC line 2 to send to port 9004 and receive on 9003, then import
 
 ## Documentation
 
-The full manual is in [docs/README-original.md](docs/README-original.md). It covers MA setup,
+The full manual is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). It covers MA setup,
 configuration, the v2 mapping format, the message monitor and development notes.
 
 ## License
