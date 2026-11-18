@@ -24,6 +24,15 @@ pub struct AppConfig {
     pub heartbeat_timeout_ms: u64,
     /// Log folder; default `logs` next to the config file.
     pub log_dir: Option<PathBuf>,
+    /// Agent access (MCP server on 127.0.0.1); off when absent.
+    pub mcp: Option<McpConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpConfig {
+    /// TCP port of the MCP server, e.g. 9005.
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]

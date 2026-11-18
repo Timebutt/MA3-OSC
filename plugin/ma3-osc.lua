@@ -23,6 +23,7 @@
 --  * executors set to Fix on another page are reported too, under their own page
 --  * reports the command line, and finishes a waiting command ("Assign Sequence 5")
 --    when an executor button on the surface is pressed, like a console's executor key
+--  * answers read-only requests from MA3-OSC's agent interface (MCP)
 
 -- OSC line in Menu > In & Out > OSC that points to MA3-OSC. To use another
 -- line without editing this file: SetGlobalVariable "ma3OscEntry" 3
@@ -66,10 +67,25 @@ local oldCmdline = nil
 local clearMethod = nil
 local clearFailed = false
 
+-- MA3-OSC's agent interface (MCP) sets this global variable to
+-- "<id>:<base64 request>". The reply goes back as /ma3osc/rpc messages.
+local RPC_VAR = "ma3OscRpc"
+local RPC_PROTOCOL = 1
+-- Base64 characters per reply message. MA drops (with only a System Monitor
+-- note) any OSC packet over 2048 bytes, and Cmd still returns "OK".
+local RPC_CHUNK = 1700
+local RPC_MAX_CHUNKS = 64
+
+-- Cmd() returns "OK" on success (grandMA3 2.5), older versions may return
+-- nothing or true. Anything else is MA's error text, e.g. "Illegal object".
+local function cmdOk(result)
+    return result == nil or result == true or string.upper(tostring(result)) == "OK"
+end
+
 local function send(addr, typ, value)
     local result = Cmd('SendOSC ' .. oscEntry .. ' "' .. addr .. ',' .. typ .. ',' .. tostring(value) .. '"')
-    -- Cmd returns "Ok" on success (older versions may return nothing)
-    local failed = result ~= nil and result ~= "Ok" and result ~= true
+    -- Note: an over-long message is dropped by MA but still returns "OK".
+    local failed = not cmdOk(result)
     if failed and not sendFailed then
         Printf("MA3-OSC plugin: SendOSC on OSC line " .. oscEntry .. " failed (" .. tostring(result) .. ").")
         Printf("  Check Menu > In & Out > OSC: line " .. oscEntry .. " exists, 'Send' is Yes, 'Enable Output' is on,")
@@ -246,7 +262,7 @@ local function handleCmdline(forceReload)
             local command = completeCommand(text, tostring(target))
             Printf("MA3-OSC plugin: " .. command)
             local result = Cmd(command)
-            if result ~= nil and result ~= "Ok" and result ~= true then
+            if not cmdOk(result) then
                 Printf("MA3-OSC plugin: '" .. command .. "' failed (" .. tostring(result) .. ")")
             end
             clearCmdline(cmdline)
@@ -256,6 +272,413 @@ local function handleCmdline(forceReload)
     if text ~= oldCmdline or forceReload then
         oldCmdline = text
         send("/cmdline", "s", clean(text))
+    end
+end
+
+-- ------------------------------------------------------------------ requests
+-- Read-only requests from MA3-OSC (its MCP server for agents). A request is
+-- "<id>:<base64 text>"; the text is a tool name, then one "key=value" per line.
+-- The reply is JSON {"ok":true,"result":...} or {"ok":false,"error":"..."},
+-- base64 encoded and sent in chunks as /ma3osc/rpc <id> <index> <count> <chunk>.
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64_INDEX = {}
+for i = 1, 64 do
+    B64_INDEX[string.byte(B64, i)] = i - 1
+end
+
+-- Plain arithmetic instead of bit operators, so it runs on any Lua version.
+local function b64encode(data)
+    local out = {}
+    for i = 1, #data, 3 do
+        local a, b, c = string.byte(data, i, i + 2)
+        local n = a * 65536 + (b or 0) * 256 + (c or 0)
+        local d1, d2 = math.floor(n / 262144) % 64, math.floor(n / 4096) % 64
+        local d3, d4 = math.floor(n / 64) % 64, n % 64
+        out[#out + 1] = string.sub(B64, d1 + 1, d1 + 1) .. string.sub(B64, d2 + 1, d2 + 1) ..
+            (b and string.sub(B64, d3 + 1, d3 + 1) or "=") .. (c and string.sub(B64, d4 + 1, d4 + 1) or "=")
+    end
+    return table.concat(out)
+end
+
+local function b64decode(text)
+    text = (string.gsub(text, "[^%w%+/]", ""))
+    local out = {}
+    for i = 1, #text, 4 do
+        local n, k = 0, 0
+        for j = i, math.min(i + 3, #text) do
+            n = n * 64 + (B64_INDEX[string.byte(text, j)] or 0)
+            k = k + 1
+        end
+        for _ = k + 1, 4 do
+            n = n * 64
+        end
+        local bytes = string.char(math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256)
+        out[#out + 1] = string.sub(bytes, 1, math.floor(k * 3 / 4))
+    end
+    return table.concat(out)
+end
+
+local JSON_ESCAPES = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+
+local function jsonString(s)
+    return '"' .. (string.gsub(s, '[%c"\\]', function(c)
+        return JSON_ESCAPES[c] or string.format("\\u%04x", string.byte(c))
+    end)) .. '"'
+end
+
+-- Tables with keys 1..n (or empty) become arrays, others objects.
+local function toJson(v)
+    local t = type(v)
+    if t == "nil" then
+        return "null"
+    elseif t == "boolean" then
+        return tostring(v)
+    elseif t == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then
+            return "null"
+        elseif v == math.floor(v) and math.abs(v) < 1e15 then
+            return string.format("%d", v)
+        end
+        return string.format("%.10g", v)
+    elseif t == "table" then
+        local parts = {}
+        if #v > 0 or next(v) == nil then
+            for i = 1, #v do
+                parts[i] = toJson(v[i])
+            end
+            return "[" .. table.concat(parts, ",") .. "]"
+        end
+        local keys = {}
+        for k in pairs(v) do
+            keys[#keys + 1] = tostring(k)
+        end
+        table.sort(keys)
+        for _, k in ipairs(keys) do
+            parts[#parts + 1] = jsonString(k) .. ":" .. toJson(v[k])
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    return jsonString(tostring(v))
+end
+
+-- Calls f if it exists in this MA version; nil if missing or on error.
+local function try(f, ...)
+    if type(f) ~= "function" then
+        return nil
+    end
+    local ok, v = pcall(f, ...)
+    if ok then
+        return v
+    end
+    return nil
+end
+
+-- A property as a plain value (string, number, boolean or nil).
+local function prop(obj, ...)
+    if obj == nil then
+        return nil
+    end
+    for _, name in ipairs({ ... }) do
+        local ok, v = pcall(function() return obj[name] end)
+        if ok and v ~= nil then
+            local t = type(v)
+            if t == "string" or t == "number" or t == "boolean" then
+                return v
+            end
+            return tostring(v)
+        end
+    end
+    return nil
+end
+
+local function className(obj)
+    local ok, v = pcall(function() return obj:GetClass() end)
+    if ok and type(v) == "string" then
+        return v
+    end
+    return nil
+end
+
+local function intArg(args, name, default, low, high)
+    local v = args[name]
+    if v == nil or v == "" then
+        return default
+    end
+    local n = tonumber(v)
+    if n == nil or n ~= math.floor(n) or n < low or n > high then
+        error(name .. " must be a whole number from " .. low .. " to " .. high, 0)
+    end
+    return n
+end
+
+-- Pools an agent may list, by the lower-case name it uses.
+local POOLS = {
+    sequences = "Sequences", groups = "Groups", macros = "Macros", pages = "Pages",
+    timecodes = "Timecodes", plugins = "Plugins", worlds = "Worlds", filters = "Filters",
+    matricks = "MAtricks", layouts = "Layouts", presets = "PresetPools",
+}
+
+local RPC_TOOLS = {}
+
+function RPC_TOOLS.hello()
+    return { protocol = RPC_PROTOCOL, version = try(Version) }
+end
+
+function RPC_TOOLS.status()
+    local page = try(CurrentExecPage)
+    local masters = {}
+    for _, name in ipairs(MASTERS) do
+        masters[name] = try(masterEnabled, name)
+    end
+    return {
+        protocol = RPC_PROTOCOL,
+        version = try(Version),
+        hostOS = try(HostOS),
+        page = prop(page, "index"),
+        commandLine = cmdlineText(try(CmdObj)),
+        deskLocked = try(DeskLocked) and true or false,
+        selectedFixtures = try(SelectionCount),
+        mastersEnabled = masters,
+        oscLine = oscEntry,
+    }
+end
+
+function RPC_TOOLS.executors(args)
+    local pageNo = intArg(args, "page", nil, 1, 9999)
+    local pageObj
+    if pageNo ~= nil then
+        for _, p in pairs(children(DataPool().Pages)) do
+            if prop(p, "index") == pageNo then
+                pageObj = p
+            end
+        end
+    else
+        pageObj = CurrentExecPage()
+    end
+    if pageObj == nil then
+        error("page " .. tostring(pageNo) .. " does not exist", 0)
+    end
+    local list = {}
+    for _, exec in pairs(children(pageObj)) do
+        local e = { no = prop(exec, "No", "no"), key = prop(exec, "KEY"), fix = isFixed(exec) }
+        local okF, fader = pcall(function() return exec:GetFader({ token = "FaderMaster", faderDisabled = false }) end)
+        if okF and type(fader) == "number" then
+            e.fader = fader
+        end
+        local okO, obj = pcall(function() return exec.Object end)
+        if okO and obj ~= nil then
+            e.object = { class = className(obj), no = prop(obj, "No", "no"), name = prop(obj, "NAME", "Name"),
+                cue = prop(obj, "CUENAME") }
+            local okR, running = pcall(isRunning, obj)
+            if okR then
+                e.running = running
+            end
+        end
+        if e.no ~= nil then
+            list[#list + 1] = e
+        end
+    end
+    table.sort(list, function(a, b) return (tonumber(a.no) or 0) < (tonumber(b.no) or 0) end)
+    return { page = prop(pageObj, "index", "No"), name = prop(pageObj, "NAME", "Name"), executors = list }
+end
+
+function RPC_TOOLS.pool(args)
+    local poolName = string.lower(tostring(args.pool or ""))
+    local key = POOLS[poolName]
+    if key == nil then
+        local names = {}
+        for k in pairs(POOLS) do
+            names[#names + 1] = k
+        end
+        table.sort(names)
+        error("unknown pool '" .. poolName .. "'; use one of: " .. table.concat(names, ", "), 0)
+    end
+    local pool
+    if key == "PresetPools" then
+        local presetPool = intArg(args, "presetPool", nil, 1, 99)
+        if presetPool == nil then
+            error("presets need presetPool (1 Dimmer, 2 Position, 3 Gobo, 4 Color, 5 Beam, ...)", 0)
+        end
+        pool = DataPool().PresetPools[presetPool]
+    else
+        pool = DataPool()[key]
+    end
+    if pool == nil then
+        error("pool " .. poolName .. " is not available", 0)
+    end
+    local offset = intArg(args, "offset", 0, 0, 100000)
+    local limit = intArg(args, "limit", 200, 1, 500)
+    local all = {}
+    for _, obj in ipairs(children(pool)) do
+        all[#all + 1] = { no = prop(obj, "No", "no", "index"), name = prop(obj, "NAME", "Name"), class = className(obj) }
+    end
+    table.sort(all, function(a, b) return (tonumber(a.no) or 0) < (tonumber(b.no) or 0) end)
+    local items = {}
+    for i = offset + 1, math.min(#all, offset + limit) do
+        items[#items + 1] = all[i]
+    end
+    return { pool = poolName, total = #all, offset = offset, items = items, more = offset + limit < #all }
+end
+
+-- Name of a referenced object (fixture type, DMX mode, ...), nil if none.
+local function refName(obj, ...)
+    for _, name in ipairs({ ... }) do
+        local ok, v = pcall(function() return obj[name] end)
+        if ok and v ~= nil then
+            if type(v) == "string" or type(v) == "number" then
+                return v
+            end
+            return prop(v, "NAME", "Name")
+        end
+    end
+    return nil
+end
+
+local function childNamed(obj, name)
+    local ok, v = pcall(function() return obj[name] end)
+    if ok and v ~= nil and type(v) ~= "string" and type(v) ~= "number" then
+        return v
+    end
+    for _, c in pairs(children(obj)) do
+        if prop(c, "NAME", "Name") == name then
+            return c
+        end
+    end
+    return nil
+end
+
+-- MA shows an empty ID, layer, address, ... as "None" (or ""): treat it as missing.
+local function present(v)
+    if v == nil or v == "" or v == "None" then
+        return nil
+    end
+    return v
+end
+
+-- FID and CID as text: whole numbers ("101") and sub-fixture IDs ("101.1") alike.
+local function idText(v)
+    v = present(v)
+    if type(v) == "number" and v == math.floor(v) then
+        return string.format("%d", v)
+    end
+    return v ~= nil and tostring(v) or nil
+end
+
+local function fixtureInfo(entry)
+    local fixture = entry.fixture
+    local subs = #children(fixture)
+    return {
+        fid = idText(prop(fixture, "FID", "fid")),
+        cid = idText(prop(fixture, "CID", "cid")),
+        idType = present(refName(fixture, "IDTYPE", "IdType", "idtype")),
+        name = present(prop(fixture, "NAME", "Name")),
+        fixtureType = present(refName(fixture, "FIXTURETYPE", "FixtureType")),
+        mode = present(refName(fixture, "MODE", "Mode")),
+        patch = present(prop(fixture, "PATCH", "Patch")),
+        layer = present(refName(fixture, "LAYER", "Layer")),
+        class = present(refName(fixture, "CLASS", "Class")),
+        stage = entry.stage,
+        depth = entry.depth,
+        parent = entry.parent,
+        subfixtures = subs > 0 and subs or nil,
+    }
+end
+
+-- A fixture and everything below it, depth first (grouping fixtures, sub-fixtures).
+local FIXTURE_DEPTH = 8
+local function walkFixtures(fixture, stage, parent, depth, out)
+    out[#out + 1] = { fixture = fixture, stage = stage, parent = parent, depth = depth }
+    if depth >= FIXTURE_DEPTH then
+        return
+    end
+    local me = idText(prop(fixture, "FID", "fid")) or present(prop(fixture, "NAME", "Name"))
+    for _, child in ipairs(children(fixture)) do
+        walkFixtures(child, stage, me, depth + 1, out)
+    end
+end
+
+-- Every fixture of every stage in the patch, depth first in patch order.
+function RPC_TOOLS.fixtures(args)
+    local offset = intArg(args, "offset", 0, 0, 100000)
+    local limit = intArg(args, "limit", 100, 1, 300)
+    local patch = try(Patch)
+    if patch == nil then
+        error("cannot read the patch (Patch() is not available)", 0)
+    end
+    local stages = childNamed(patch, "Stages")
+    if stages == nil then
+        error("cannot find the stages in the patch", 0)
+    end
+    local all = {}
+    for _, stage in ipairs(children(stages)) do
+        local fixtures = childNamed(stage, "Fixtures")
+        if fixtures ~= nil then
+            local stageName = present(prop(stage, "NAME", "Name"))
+            for _, fixture in ipairs(children(fixtures)) do
+                walkFixtures(fixture, stageName, nil, 0, all)
+            end
+        end
+    end
+    local items = {}
+    for i = offset + 1, math.min(#all, offset + limit) do
+        items[#items + 1] = fixtureInfo(all[i])
+    end
+    return { total = #all, offset = offset, items = items, more = offset + limit < #all }
+end
+
+local function parseRequest(text)
+    local tool, args = nil, {}
+    for line in string.gmatch(text, "[^\n]+") do
+        if tool == nil then
+            tool = line
+        else
+            local k, v = string.match(line, "^([%w_]+)=(.*)$")
+            if k ~= nil then
+                args[k] = v
+            end
+        end
+    end
+    return tool, args
+end
+
+local function rpcReply(id, reply)
+    local data = b64encode(toJson(reply))
+    local count = math.max(1, math.ceil(#data / RPC_CHUNK))
+    if count > RPC_MAX_CHUNKS then
+        data = b64encode(toJson({ ok = false, error = "reply too large; ask for fewer items (limit/offset)" }))
+        count = 1
+    end
+    for i = 1, count do
+        local chunk = string.sub(data, (i - 1) * RPC_CHUNK + 1, i * RPC_CHUNK)
+        send("/ma3osc/rpc", "siis", id .. "," .. i .. "," .. count .. "," .. chunk)
+    end
+end
+
+-- Runs a waiting request, if any. Errors become an error reply.
+local function handleRpc()
+    local request = GetVar(GlobalVars(), RPC_VAR)
+    if request == nil or request == "" then
+        return
+    end
+    SetVar(GlobalVars(), RPC_VAR, "")
+    local id, body = string.match(tostring(request), "^(%w+):([%w%+/=]*)$")
+    if id == nil then
+        Printf("MA3-OSC plugin: ignored a malformed request in " .. RPC_VAR)
+        return
+    end
+    local ok, result = pcall(function()
+        local tool, args = parseRequest(b64decode(body))
+        local f = RPC_TOOLS[tool or ""]
+        if f == nil then
+            error("unknown request '" .. tostring(tool) .. "'", 0)
+        end
+        return f(args)
+    end)
+    if ok then
+        rpcReply(id, { ok = true, result = result })
+    else
+        rpcReply(id, { ok = false, error = tostring(result) })
     end
 end
 
@@ -282,6 +705,7 @@ local function main()
     SetVar(GlobalVars(), "ma3OscStop", false)
     SetVar(GlobalVars(), "ma3OscAlive", os.time())
     SetVar(GlobalVars(), TARGET_VAR, "")
+    SetVar(GlobalVars(), RPC_VAR, "")
     oscEntry = tonumber(GetVar(GlobalVars(), "ma3OscEntry") or DEFAULT_OSC_ENTRY) or DEFAULT_OSC_ENTRY
     sendFailed = false
 
@@ -325,6 +749,7 @@ local function main()
         end
 
         handleCmdline(forceReload)
+        handleRpc()
 
         local pageObj = CurrentExecPage()
         if cfg.fixedPage ~= 0 and DataPool().Pages[cfg.fixedPage] then

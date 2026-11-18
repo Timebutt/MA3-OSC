@@ -9,11 +9,13 @@ mod config;
 mod engine;
 mod mapping;
 mod mapping_v2;
+mod mcp;
 mod midi;
 mod midi_io;
 mod monitor;
 mod monitor_view;
 mod osc_io;
+mod rpc;
 mod status;
 mod surface;
 mod tray;
@@ -271,6 +273,14 @@ fn shared_status(cfg: &AppConfig) -> Shared {
 fn run_forever(cfg: AppConfig, devices: Devices, shared: Shared) -> ! {
     let retry = Duration::from_secs(5);
     let (tx, rx) = mpsc::channel::<Event>();
+    let broker = cfg.mcp.as_ref().and_then(|m| match start_mcp(&cfg, m.port, &shared) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            // the surfaces still work; only agent access is missing
+            error!("{e:#}");
+            None
+        }
+    });
     loop {
         match osc_io::spawn_listener(cfg.ma.listen_port, tx.clone()) {
             Ok(()) => break,
@@ -282,11 +292,25 @@ fn run_forever(cfg: AppConfig, devices: Devices, shared: Shared) -> ! {
         }
     }
     loop {
-        let e = run(&cfg, devices.clone(), &rx, tx.clone(), &shared).unwrap_err();
+        let e = run(&cfg, devices.clone(), &rx, tx.clone(), &shared, broker.as_deref()).unwrap_err();
         error!("{e:#} (retrying in {retry:?})");
         status::update(&shared, |s| s.error = Some(format!("{e:#}")));
         std::thread::sleep(retry);
     }
+}
+
+/// The MCP server sends requests on its own socket; replies come back through
+/// the main loop, which hands them to the broker.
+fn start_mcp(cfg: &AppConfig, port: u16, shared: &Shared) -> Result<std::sync::Arc<rpc::Broker>> {
+    let mut out = osc_io::OscOut::new(&cfg.ma.host, cfg.ma.port)?;
+    let broker = std::sync::Arc::new(rpc::Broker::new(
+        &cfg.ma.prefix,
+        Duration::from_secs(2),
+        Box::new(move |addr, args| out.send(addr, args)),
+    ));
+    let b = broker.clone();
+    mcp::spawn(port, Box::new(move |tool, args| b.call(tool, args)), shared.clone())?;
+    Ok(broker)
 }
 
 fn init_logging(dir: Option<&Path>) -> Option<tracing_appender::non_blocking::WorkerGuard> {
@@ -348,7 +372,14 @@ fn guarded(what: &str, f: impl FnOnce()) {
 }
 
 /// Runs the bridge; only returns on a problem that needs a fresh start.
-fn run(cfg: &AppConfig, devices: Devices, rx: &Receiver<Event>, tx: Sender<Event>, shared: &Shared) -> Result<()> {
+fn run(
+    cfg: &AppConfig,
+    devices: Devices,
+    rx: &Receiver<Event>,
+    tx: Sender<Event>,
+    shared: &Shared,
+    broker: Option<&rpc::Broker>,
+) -> Result<()> {
     let mut osc = osc_io::OscOut::new(&cfg.ma.host, cfg.ma.port)?;
     let specs = cfg
         .devices
@@ -383,6 +414,10 @@ fn run(cfg: &AppConfig, devices: Devices, rx: &Receiver<Event>, tx: Sender<Event
             }),
             Ok(Event::Osc { addr, args }) => guarded("OSC input", || {
                 monitor::get().osc(monitor::Dir::OscIn, &addr, &args);
+                // an agent reply; the engine still sees it as a sign of life from MA
+                if let (rpc::REPLY_ADDR, Some(b)) = (addr.as_str(), broker) {
+                    b.deliver(&args);
+                }
                 engine.osc_in(&addr, &args, &mut IoSink { midi: &mut midi, osc: &mut osc, names: &names }, Instant::now())
             }),
             Err(RecvTimeoutError::Timeout) => {}

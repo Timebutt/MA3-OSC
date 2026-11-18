@@ -170,6 +170,105 @@ You can also pass `--config <file>`.
 - Logs go to `logs/` next to the config: daily files, 14 days kept.
   `RUST_LOG=debug` logs every message.
 
+## Agent access (MCP)
+
+MA3-OSC can run an [MCP](https://modelcontextprotocol.io) server, so an AI agent such as
+Claude Code can read the desk. It is off unless the config has an `mcp` key:
+
+```json
+    "mcp": { "port": 9005 }
+```
+
+Then connect the agent, for example:
+
+```sh
+claude mcp add --transport http ma3 http://127.0.0.1:9005/mcp
+```
+
+- The server listens on 127.0.0.1 only. It refuses requests whose Host or Origin header is
+  not local, so a web page cannot reach it through DNS rebinding.
+- All tools are read-only:
+  - `ma_status`: the bridge (MA link, connected surfaces) and grandMA3 (version, current
+    page, command line, selected fixture count, desk lock, master states). The bridge part
+    is answered even when MA is unreachable.
+  - `ma_list_executors`: the executors on a page (default: the current page), with the
+    assigned object, its current cue, whether it runs, and the fader and key functions.
+  - `ma_list_pool`: number and name of the objects in a pool (`sequences`, `groups`,
+    `macros`, `pages`, `timecodes`, `plugins`, `worlds`, `filters`, `matricks`, `layouts`,
+    or `presets` with `presetPool`), at most 500 per call via `offset` and `limit`.
+  - `ma_list_fixtures`: every fixture in the patch, depth first: grouping fixtures, the
+    fixtures below them and their sub-fixtures, each with `depth` and `parent`. It gives FID
+    and CID (always as text, e.g. "101.1"), name, fixture type, DMX mode, DMX address,
+    layer, class and stage. MA reports a missing value as "None"; the tool leaves it out. It returns at most 300
+    fixtures per call (default 100), paged with `offset` and `limit`. It reads
+    Patch → Stages → each stage's Fixtures. Group contents are not listed: MA's Lua API
+    only shows them by selecting the group, which would change the programmer.
+- The tools need the current MA3-OSC plugin running in grandMA3. With an older plugin
+  (no heartbeat) or no link, they fail at once with an explanation instead of waiting.
+- Show-file text (names, labels) is passed to the agent as data. The server's instructions
+  tell the agent not to follow requests found in it.
+
+### How a request reaches MA
+
+grandMA3 has no OSC request/reply, so the channel is built from what MA offers
+(`src/rpc.rs` and the RPC part of `plugin/ma3-osc.lua`):
+
+1. MA3-OSC sends OSC `/cmd SetGlobalVariable "ma3OscRpc" "<id>:<base64>"`. The plaintext
+   is the request name, then one `key=value` line per argument.
+2. The plugin polls that variable at 10 Hz, clears it and runs the request.
+3. It answers with `/ma3osc/rpc ,siis <id> <index> <count> <chunk>`. The chunks join into
+   base64 of `{"ok":true,"result":...}` or `{"ok":false,"error":"..."}`.
+
+- One request is in flight at a time, because there is one request variable.
+- A request must fit in one packet (at most 1,800 base64 characters). A reply is split
+  into chunks of 1,700 characters (about 1,740-byte packets), at most 64 of them.
+- A missing chunk shows up as a timeout: 2 s without a new chunk. The timeout counts from
+  the last chunk, because MA sends about one chunk per 30 ms and a 50-chunk reply takes
+  longer than 2 s. Requests are read-only, so it is sent once
+  more under a new id. A late reply to the old id is ignored.
+- Before the first request, and again after any failure, a `hello` handshake checks
+  that the plugin speaks the same protocol (`PROTOCOL` in `rpc.rs` equals
+  `RPC_PROTOCOL` in the plugin; raise both when the format changes) and reads `Version()`.
+- Requests appear in the message monitor as OSC out, replies as OSC in.
+
+## grandMA3 2.5 behaviour (measured)
+
+The numbers below were measured on grandMA3 onPC 2.5.1.1 (macOS arm64) with a throwaway probe
+plugin. They are behaviour the documentation does not state or gets wrong. Check them
+again before relying on them with another MA version.
+
+- **`Cmd()` returns `"OK"`** (capitals) on success. Earlier code compared with `"Ok"`, so
+  every success counted as a failure. The plugin now compares without regard to case.
+- **Errors are MA's own text, not the documented "Syntax Error"/"Illegal Command".**
+  An unknown keyword returns `"Object not found"`, because MA reads
+  `Ma3ProbeNotAKeyword 1` as `Channel "Ma3ProbeNotAKeyword" 1`. A missing object returns
+  `"Illegal object"`. Treat anything other than "OK" as a failure and show the text.
+- **OSC packets are limited to 2,048 bytes in both directions, and failures are silent.**
+  - Out of MA (SendOSC): a packet of about 2,044 bytes arrived; one of about 2,084 bytes
+    did not. MA logs `OSC output packet size exceeded.` in the System Monitor, drops the
+    message, and `Cmd` still returns "OK".
+  - Into MA (`/cmd`): 2,048 bytes of UDP arrived intact. A larger packet is cut to about
+    2,048 bytes (the variable got 2,003 characters), and the command still runs and
+    returns "OK" with the shortened text.
+  - So: keep every packet well below 2 KB, and make truncation detectable (chunk counts,
+    an end marker, a decode check).
+- macOS refuses to send a UDP datagram over about 9 KB (`Message too long`).
+- **SendOSC carries base64 unchanged** (`+`, `/`, `=`), and multi-argument type strings
+  such as `siis` work.
+- **Lua functions present in 2.5.1.1:** `CreateUndo`, `CloseUndo`, `CmdIndirect`,
+  `CmdIndirectWait`, `SetProgPhaser` (not documented), `GetUIChannelIndex`,
+  `GetAttributeIndex`, `SelectionFirst`, `SelectionCount`, `CmdObj`, `GetPath`, `HostOS`.
+  **Missing:** `CmdlineIndex`. `Version()` returns `"2.5.1.1"`.
+- **MA logs every `/cmd` it receives and every SendOSC** in the System Monitor ("OK: …"
+  and `OSC::Data::CommandSendOSC 2`). Busy OSC traffic fills that log. That is one more
+  reason the plugin sends only changes.
+- **Latency:** the plugin picks up a request within its 100 ms poll interval. A `Cmd` call
+  takes about 20–35 ms because it waits for MA's main task, so a reply of many chunks takes
+  correspondingly longer.
+- Any OSC from MA counts as a sign of life for the link watchdog. Traffic from another
+  plugin (here, the probe) while the MA3-OSC plugin is stopped makes the bridge see the link
+  as "restored" and ask for a reload (`forceReload`) each time.
+
 ## Mapping files
 
 ### v2 format (recommended for new mappings)
@@ -266,6 +365,9 @@ appearance color.
   the tray icon turns red when MA goes quiet. When MA comes back, the bridge asks it for a
   full reload.
 - A bug while handling one message is logged and skipped. It never stops the program.
+- **SendOSC failures are reported correctly.** grandMA3 2.5 answers "OK", not "Ok". The old
+  comparison treated every send and every Assign/Edit as failed.
+- **Agent access.** An optional, read-only MCP server (see [Agent access](#agent-access-mcp)).
 
 ## Development
 
@@ -284,6 +386,8 @@ cargo check --target x86_64-pc-windows-msvc   # Windows type-check from a Mac
 | `src/midi_io.rs` | port matching and hot-plug |
 | `src/osc_io.rs` | UDP OSC |
 | `src/config.rs` | app config |
+| `src/mcp.rs` | MCP server for agents (HTTP on 127.0.0.1, read-only tools) |
+| `src/rpc.rs` | request/reply channel to the MA plugin: chunking, timeout, retry, handshake |
 | `src/tray.rs`, `src/status.rs` | tray icon and status |
 | `src/monitor.rs`, `src/monitor_view.rs`, `src/monitor_view.html` | message monitor capture and window |
 | `src/autostart.rs` | start at login |
