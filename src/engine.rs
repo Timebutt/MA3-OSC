@@ -18,7 +18,7 @@ use crate::midi::MidiMsg;
 use crate::surface::{OutKey, OutVal, Surface};
 use crate::xtouch;
 use rosc::OscType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
@@ -53,6 +53,8 @@ impl Default for EngineConfig {
 const BLANK: [u8; xtouch::STRIP_CHARS] = [b' '; xtouch::STRIP_CHARS];
 const TIMECODE_LONG_PRESS: Duration = Duration::from_millis(500);
 const RELOAD_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// MA global variable the plugin watches for an executor that completes the command line.
+const CMDLINE_TARGET_VAR: &str = "ma3OscTarget";
 
 /// How long after a motor command the fader may still be travelling. Surfaces
 /// without touch sensing (X-Touch Compact) report their position while the
@@ -78,6 +80,8 @@ pub struct Device {
     travel: HashMap<OutKey, Travel>,
     names: [([u8; 7], [u8; 7]); 8],
     colors: [u8; 8],
+    /// Executor buttons whose press went to MA's command line: their release is dropped.
+    to_cmdline: HashSet<u8>,
 }
 
 /// Hysteresis for absolute faders and encoders (0..127 scale).
@@ -143,6 +147,8 @@ pub struct Engine {
     ma_lost: bool,
     last_reload_request: Option<Instant>,
     last_refresh: Instant,
+    /// MA's command line holds a command waiting for its destination (reported by the plugin).
+    cmdline_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +174,7 @@ impl Engine {
                 travel: HashMap::new(),
                 names: [(BLANK, BLANK); 8],
                 colors: [xtouch::COLOR_OFF; 8],
+                to_cmdline: HashSet::new(),
             })
             .collect::<Vec<_>>();
         let mut e = Engine {
@@ -187,6 +194,7 @@ impl Engine {
             ma_lost: false,
             last_reload_request: None,
             last_refresh: now,
+            cmdline_pending: false,
         };
         for d in 0..e.devices.len() {
             let dev = &mut e.devices[d];
@@ -244,6 +252,7 @@ impl Engine {
             dev.surface.disconnect();
             dev.fader_in.clear();
             dev.travel.clear();
+            dev.to_cmdline.clear();
         }
     }
 
@@ -286,6 +295,7 @@ impl Engine {
         {
             warn!("no heartbeat from grandMA3 for {:?}: link LOST", self.cfg.heartbeat_timeout);
             self.ma_lost = true;
+            self.cmdline_pending = false;
             for d in 0..self.devices.len() {
                 self.render_display(d, &mut outs[d]);
             }
@@ -488,7 +498,20 @@ impl Engine {
         }
 
         if let Some(exec) = a.exec {
-            self.osc_int(sink, &format!("/Page{}/Key{}", self.page_of(exec), exec), vel as i32);
+            if vel > 0 && self.cmdline_pending && !a.ignore_cmdline {
+                // Like an executor key on a console: a command waiting in MA's
+                // command line ("Assign Sequence 5") gets this executor as its
+                // destination. OSC key presses can't do that, so the plugin
+                // finishes the command; this tells it which executor was pressed.
+                let target = format!("Page {}.{}", self.page_of(exec), exec);
+                info!(%target, "executor pressed with a pending command line");
+                self.send_cmd(sink, &format!("SetGlobalVariable \"{CMDLINE_TARGET_VAR}\" \"{target}\""));
+                self.devices[d].to_cmdline.insert(note);
+            } else if vel == 0 && self.devices[d].to_cmdline.remove(&note) {
+                // release of a press that went to the command line
+            } else {
+                self.osc_int(sink, &format!("/Page{}/Key{}", self.page_of(exec), exec), vel as i32);
+            }
         }
         if let Some(q) = &a.quickey {
             self.send_cmd(sink, &format!("Go+ Quickey \"{q}\""));
@@ -556,6 +579,17 @@ impl Engine {
                 }
                 self.desk_locked = *b;
             }
+            self.flush(outs, sink);
+            return;
+        }
+
+        if addr == "/cmdline" {
+            let text = args.first().and_then(arg_str).unwrap_or_default();
+            let pending = !text.trim().is_empty();
+            if pending != self.cmdline_pending {
+                debug!(%text, "MA command line changed");
+            }
+            self.cmdline_pending = pending;
             self.flush(outs, sink);
             return;
         }
@@ -1186,6 +1220,51 @@ mod tests {
         // after a page change the plugin re-reports; until then the current page is used
         e.osc_in("/updatePage/current", &[OscType::Int(3)], &mut r, t0);
         assert_eq!(e.page_of(201), "3");
+    }
+
+    #[test]
+    fn executor_press_completes_pending_command_line() {
+        let (mut e, mut r, t0) = setup(vec![mapping("xTouch1.json")]);
+        e.osc_in("/updatePage/current", &[OscType::Int(3)], &mut r, t0);
+        e.osc_in("/cmdline", &[s("Assign Sequence 5")], &mut r, t0);
+        r.osc.clear();
+        // note 16 = SOLO row, executor 201
+        e.midi_in(0, &MidiMsg::Note { ch: 1, note: 16, vel: 127 }.encode(), &mut r, t0);
+        e.midi_in(0, &MidiMsg::Note { ch: 1, note: 16, vel: 0 }.encode(), &mut r, t0);
+        assert_eq!(r.osc, vec![("/cmd".to_string(), vec![s(r#"SetGlobalVariable "ma3OscTarget" "Page 3.201""#)])]);
+
+        // command line empty again: normal key press and release
+        e.osc_in("/cmdline", &[s("")], &mut r, t0);
+        r.osc.clear();
+        e.midi_in(0, &MidiMsg::Note { ch: 1, note: 16, vel: 127 }.encode(), &mut r, t0);
+        e.midi_in(0, &MidiMsg::Note { ch: 1, note: 16, vel: 0 }.encode(), &mut r, t0);
+        assert_eq!(
+            r.osc,
+            vec![
+                ("/Page3/Key201".to_string(), vec![OscType::Int(127)]),
+                ("/Page3/Key201".to_string(), vec![OscType::Int(0)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn key_released_after_command_line_fills_still_releases() {
+        let (mut e, mut r, t0) = setup(vec![mapping("xTouch1.json")]);
+        e.midi_in(0, &MidiMsg::Note { ch: 1, note: 16, vel: 127 }.encode(), &mut r, t0);
+        e.osc_in("/cmdline", &[s("Store")], &mut r, t0);
+        e.midi_in(0, &MidiMsg::Note { ch: 1, note: 16, vel: 0 }.encode(), &mut r, t0);
+        assert_eq!(r.osc.last().unwrap(), &("/Page1/Key201".to_string(), vec![OscType::Int(0)]));
+    }
+
+    #[test]
+    fn ignore_cmdline_button_always_sends_key() {
+        let mut m = mapping("xTouch1.json");
+        m.notes.get_mut(&16).unwrap().ignore_cmdline = true;
+        let (mut e, mut r, t0) = setup(vec![m]);
+        e.osc_in("/cmdline", &[s("Assign Sequence 5")], &mut r, t0);
+        r.osc.clear();
+        e.midi_in(0, &MidiMsg::Note { ch: 1, note: 16, vel: 127 }.encode(), &mut r, t0);
+        assert_eq!(r.osc, vec![("/Page1/Key201".to_string(), vec![OscType::Int(127)])]);
     }
 
     #[test]

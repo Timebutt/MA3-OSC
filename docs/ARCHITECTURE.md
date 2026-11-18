@@ -65,6 +65,27 @@ The plugin is pam-OSC.lua with these fixes:
 - It uses `IsRunningPlayback` on newer MA3 versions, so there is no deprecation warning.
 - Running it while it is already running stops it. A show file saved while it was running
   does not block the next start.
+- Executor buttons finish a command waiting in the command line, like executor keys on a
+  console. See [Executor buttons and the command line](#executor-buttons-and-the-command-line).
+
+### Executor buttons and the command line
+
+On a console, `Assign` → tap Sequence 5 → press an executor key assigns the sequence to that
+executor. An OSC key message (`/Page1/Key201`) only fires the executor, so MA3-OSC handles it:
+
+1. The plugin reports MA's command line (`/cmdline`) whenever it changes.
+2. If an executor button is pressed while the command line holds text, MA3-OSC sends
+   `SetGlobalVariable "ma3OscTarget" "Page 1.201"` instead of the key press (and drops the
+   button's release).
+3. The plugin adds the executor to the waiting command, runs it and clears the command line.
+   For `Assign`, `Copy`, `Move` and `Clone` with a source it adds `At`
+   (`Assign Sequence 5 At Page 1.201`). Anything else gets the executor directly
+   (`Store Page 1.201`, `Edit Page 1.201`, `Store Cue 5 Page 1.201`). The finished command
+   is printed in the System Monitor.
+
+With an empty command line, buttons work as before. To make a button always fire its
+executor, add `"ignoreCmdline": true` to it in the mapping. This needs the MA3-OSC plugin:
+with the old pam-OSC plugin the command line is never reported and nothing changes.
 
 The old pam-OSC plugin also works with MA3-OSC, but without the link check.
 
@@ -178,6 +199,8 @@ You can also pass `--config <file>`.
   - `minVelocity: 101` reacts to the press only.
   - `fixedLed` sets an LED value that ignores MA.
   - `feedback: {"on": 127, "off": 0}` sets the LED values for this button.
+  - `ignoreCmdline: true` always fires the executor, even when the command line waits for
+    a destination.
 - **buttonFeedback** (top level) is the default on/off LED value.
 - **midiChannel** is the default channel for LED feedback on `midi` surfaces.
 - In X-Touch modes, fader-touch notes 104–112 are added automatically. Override them with

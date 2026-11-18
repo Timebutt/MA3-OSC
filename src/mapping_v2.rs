@@ -154,6 +154,9 @@ pub struct ButtonV2 {
     pub fixed_led: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<FeedbackV2>,
+    /// Always send the executor key, even when MA's command line waits for a destination.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignore_cmdline: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
@@ -286,6 +289,7 @@ pub fn from_v2(v: &MappingV2) -> Result<DeviceMapping> {
                 .feedback
                 .map(|f| Ok::<_, anyhow::Error>(Feedback { on: u7(f.on, &at)?, off: u7(f.off, &at)? }))
                 .transpose()?,
+            ignore_cmdline: b.ignore_cmdline,
             ..Default::default()
         };
         if let Some(mv) = b.min_velocity {
@@ -371,6 +375,7 @@ pub fn to_v2(m: &DeviceMapping) -> Result<MappingV2> {
             min_velocity: n.min_value.map(|v| v + 1),
             fixed_led: n.permanent_feedback,
             feedback: n.feedback.map(|f| FeedbackV2 { on: f.on, off: f.off }),
+            ignore_cmdline: n.ignore_cmdline,
             label: None,
         });
     }

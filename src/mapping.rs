@@ -48,6 +48,8 @@ pub struct NoteAction {
     /// Fixed LED velocity that overrides feedback from MA.
     pub permanent_feedback: Option<u8>,
     pub feedback: Option<Feedback>,
+    /// Always send the executor key, even when MA's command line waits for a destination.
+    pub ignore_cmdline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -235,6 +237,7 @@ fn parse_note(v: &Value, at: &str) -> Result<NoteAction> {
             "permanentFeedback" => n.permanent_feedback = Some(as_u7(val, &at)?).filter(|v| *v > 0),
             "timecodeSelect" => n.timecode_select = as_bool(val, &at)?,
             "timecodePlayPause" => n.timecode_play_pause = as_bool(val, &at)?,
+            "ignoreCmdline" => n.ignore_cmdline = as_bool(val, &at)?,
             "buttonFeedbackMapper" => n.feedback = Some(parse_feedback_fn(as_str(val, &at)?).context(at.clone())?),
             "feedback" => {
                 let o = as_obj(val, &at)?;

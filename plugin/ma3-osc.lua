@@ -21,6 +21,8 @@
 --  * uses IsRunningPlayback (newer MA3) instead of the deprecated HasActivePlayback
 --  * if SendOSC fails, explains once how to fix the OSC setup instead of failing silently
 --  * executors set to Fix on another page are reported too, under their own page
+--  * reports the command line, and finishes a waiting command ("Assign Sequence 5")
+--    when an executor button on the surface is pressed, like a console's executor key
 
 -- OSC line in Menu > In & Out > OSC that points to MA3-OSC. To use another
 -- line without editing this file: SetGlobalVariable "ma3OscEntry" 3
@@ -52,6 +54,17 @@ local oldTimecodes = {}
 local oldDeskLocked = nil
 
 local sendFailed = false
+
+-- MA3-OSC sets this global variable to "Page <p>.<exec>" when an executor
+-- button is pressed while the command line holds a command.
+local TARGET_VAR = "ma3OscTarget"
+-- Commands whose destination follows "At" once a source is given
+-- ("Assign Sequence 5 At Page 1.201"). Others take the executor directly
+-- ("Store Page 1.201", "Edit Page 1.201", "Store Cue 5 Page 1.201").
+local AT_KEYWORDS = { "assign", "copy", "move", "clone" }
+local oldCmdline = nil
+local clearMethod = nil
+local clearFailed = false
 
 local function send(addr, typ, value)
     local result = Cmd('SendOSC ' .. oscEntry .. ' "' .. addr .. ',' .. typ .. ',' .. tostring(value) .. '"')
@@ -162,6 +175,90 @@ local function fixedExecutors()
     return result
 end
 
+-- Text in the user's command line, "" if it can't be read.
+local function cmdlineText(cmdline)
+    local ok, text = pcall(function() return cmdline.CMDTEXT end)
+    if ok and type(text) == "string" then
+        return text
+    end
+    return ""
+end
+
+-- The waiting command with the executor as its destination.
+local function completeCommand(text, target)
+    text = string.gsub(text, "%s+$", "")
+    local words = {}
+    for w in string.gmatch(text, "%S+") do
+        if string.sub(w, 1, 1) ~= "/" then -- skip options like /Merge
+            words[#words + 1] = string.lower(w)
+        end
+    end
+    local needsAt = false
+    if #words >= 2 and words[#words] ~= "at" and #words[1] >= 2 then
+        for _, k in ipairs(AT_KEYWORDS) do
+            if string.sub(k, 1, #words[1]) == words[1] then -- "As" is short for Assign
+                needsAt = true
+            end
+        end
+    end
+    return text .. (needsAt and " At " or " ") .. target
+end
+
+-- Ways to empty the user's command line; the first that works is remembered.
+local CLEARERS = {
+    { "ClearCmd()", function(c) c:ClearCmd() end },
+    { "the CLEARCMD property", function(c) c.CLEARCMD = "" end },
+    { "the Escape key", function() Keyboard(1, "press", "Escape"); Keyboard(1, "release", "Escape") end },
+}
+
+local function clearCmdline(cmdline)
+    local order = {}
+    for _, cl in ipairs(CLEARERS) do
+        if cl[1] == clearMethod then table.insert(order, 1, cl) else order[#order + 1] = cl end
+    end
+    for _, cl in ipairs(order) do
+        if pcall(cl[2], cmdline) and cmdlineText(cmdline) == "" then
+            if clearMethod ~= cl[1] then
+                clearMethod = cl[1]
+                Printf("MA3-OSC plugin: the command line is cleared with " .. cl[1])
+            end
+            return
+        end
+    end
+    if not clearFailed then
+        clearFailed = true
+        Printf("MA3-OSC plugin: could not clear the command line after finishing a command; press Esc to clear it")
+    end
+end
+
+-- Finish a waiting command with the executor MA3-OSC reported, then report
+-- the command line whenever it changes.
+local function handleCmdline(forceReload)
+    local okObj, cmdline = pcall(CmdObj)
+    if not okObj then
+        cmdline = nil
+    end
+    local text = cmdline and cmdlineText(cmdline) or ""
+    local target = GetVar(GlobalVars(), TARGET_VAR)
+    if target ~= nil and target ~= "" then
+        SetVar(GlobalVars(), TARGET_VAR, "")
+        if text ~= "" then
+            local command = completeCommand(text, tostring(target))
+            Printf("MA3-OSC plugin: " .. command)
+            local result = Cmd(command)
+            if result ~= nil and result ~= "Ok" and result ~= true then
+                Printf("MA3-OSC plugin: '" .. command .. "' failed (" .. tostring(result) .. ")")
+            end
+            clearCmdline(cmdline)
+            text = cmdlineText(cmdline)
+        end
+    end
+    if text ~= oldCmdline or forceReload then
+        oldCmdline = text
+        send("/cmdline", "s", clean(text))
+    end
+end
+
 local function settings()
     return {
         resendButtons = GetVar(GlobalVars(), "automaticResendButtons") or false,
@@ -184,6 +281,7 @@ local function main()
     end
     SetVar(GlobalVars(), "ma3OscStop", false)
     SetVar(GlobalVars(), "ma3OscAlive", os.time())
+    SetVar(GlobalVars(), TARGET_VAR, "")
     oscEntry = tonumber(GetVar(GlobalVars(), "ma3OscEntry") or DEFAULT_OSC_ENTRY) or DEFAULT_OSC_ENTRY
     sendFailed = false
 
@@ -225,6 +323,8 @@ local function main()
                 send("/masterEnabled/" .. name, "i", v and 1 or 0)
             end
         end
+
+        handleCmdline(forceReload)
 
         local pageObj = CurrentExecPage()
         if cfg.fixedPage ~= 0 and DataPool().Pages[cfg.fixedPage] then

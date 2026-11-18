@@ -170,6 +170,62 @@ fn fixed_executor_of_another_page_is_reported_under_its_page() {
     assert!(check(&lua, r#"has('SendOSC 2 "/Page2/Fader201,i,0"')"#), "{:?}", sent(&lua));
 }
 
+#[test]
+fn reports_command_line_and_completes_it_with_the_pressed_executor() {
+    let lua = setup();
+    lua.load(
+        r#"
+        cmdline = { CMDTEXT = "" }
+        function cmdline:ClearCmd() self.CMDTEXT = "" end
+        function CmdObj() return cmdline end
+        step(1)
+    "#,
+    )
+    .exec()
+    .unwrap();
+    assert!(check(&lua, r#"has('SendOSC 2 "/cmdline,s,"')"#), "{:?}", sent(&lua));
+
+    lua.load(r#"cmdline.CMDTEXT = "Assign Sequence 5"; sent = {}; step(1)"#).exec().unwrap();
+    assert_eq!(sent(&lua), vec![r#"SendOSC 2 "/cmdline,s,Assign Sequence 5""#]);
+
+    // MA3-OSC reports the pressed executor
+    lua.load(r#"vars.ma3OscTarget = "Page 1.201"; sent = {}; step(1)"#).exec().unwrap();
+    let s = sent(&lua);
+    assert_eq!(s[0], "Assign Sequence 5 At Page 1.201", "{s:?}");
+    assert!(s.contains(&r#"SendOSC 2 "/cmdline,s,""#.to_string()), "{s:?}");
+    assert!(check(&lua, r#"cmdline.CMDTEXT == "" and vars.ma3OscTarget == """#));
+    assert!(check(&lua, "printed[#printed]:find('ClearCmd') ~= nil"));
+
+    // keyword-only commands take the executor directly
+    lua.load(r#"cmdline.CMDTEXT = "Store /Merge"; step(1); vars.ma3OscTarget = "Page 2.305"; sent = {}; step(1)"#)
+        .exec()
+        .unwrap();
+    assert_eq!(sent(&lua)[0], "Store /Merge Page 2.305");
+    lua.load(r#"cmdline.CMDTEXT = "As Seq 7 At "; step(1); vars.ma3OscTarget = "Page 1.101"; sent = {}; step(1)"#)
+        .exec()
+        .unwrap();
+    assert_eq!(sent(&lua)[0], "As Seq 7 At Page 1.101");
+}
+
+#[test]
+fn unclearable_command_line_is_explained_once() {
+    let lua = setup();
+    lua.load(
+        r#"
+        cmdline = { CMDTEXT = "Store" }
+        function CmdObj() return cmdline end
+        step(1)
+        vars.ma3OscTarget = "Page 1.201"; step(1)
+        cmdline.CMDTEXT = "Store"; vars.ma3OscTarget = "Page 1.202"; step(1)
+    "#,
+    )
+    .exec()
+    .unwrap();
+    assert!(check(&lua, r#"has("Store Page 1.201") and has("Store Page 1.202")"#), "{:?}", sent(&lua));
+    let printed: Vec<String> = lua.load("return printed").eval().unwrap();
+    assert_eq!(printed.iter().filter(|p| p.contains("could not clear")).count(), 1, "{printed:?}");
+}
+
 fn b64decode(s: &str) -> Vec<u8> {
     let val = |c: u8| match c {
         b'A'..=b'Z' => c - b'A',
